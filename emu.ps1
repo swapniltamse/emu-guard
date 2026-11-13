@@ -344,6 +344,10 @@ function Invoke-Agent([string[]]$rest) {
     Assert-AgentReady
     $project = [IO.Path]::GetFullPath((Get-Location).ProviderPath).TrimEnd('\', '/')
     # The project must not be, or contain, your home folder or its key folders.
+    # A junction or symlink on the project path could hide that it is really your home folder.
+    if (Test-ReparseOnPath $project ([IO.Path]::GetPathRoot($project))) {
+        Fail "BLOCKED. The path to this project goes through a junction or symlink. Run emu agent from the real folder." 5
+    }
     $homeReal = [IO.Path]::GetFullPath($env:USERPROFILE).TrimEnd('\', '/')
     $ic = [StringComparison]::OrdinalIgnoreCase
     if (($homeReal + '\').StartsWith($project + '\', $ic)) { Fail "BLOCKED. This folder contains your home folder ($homeReal). Run emu agent from a project folder." 5 }
@@ -369,6 +373,7 @@ function Invoke-Agent([string[]]$rest) {
     }
     # Hook folders and included config files inside the project are read-only too.
     foreach ($t in @(Get-GitConfigTargets $project $before)) {
+        if ($t.StartsWith("SYMLINK`t")) { Fail "BLOCKED. Git config uses '$($t.Substring(8))', which goes through a symlink or junction the agent could replace. Use a real folder or file there." 5 }
         if (-not (Test-Path -LiteralPath $t)) { Fail "BLOCKED. Git config points at '$t', which does not exist, so the agent could create it. Create it or remove the setting." 5 }
         if ($t.Contains(',')) { Fail "BLOCKED. Cannot mount '$t' read-only (comma in path)." 5 }
         $rel = $t.Substring($project.Length).Replace('\', '/')
@@ -397,27 +402,82 @@ function Invoke-Agent([string[]]$rest) {
     exit $code
 }
 
-# Paths that a repo's own config tells git to run or read: core.hooksPath (husky uses .husky)
-# and include.path. Read with --file, which runs nothing. Returns targets inside the project.
+# Config keys whose value is a path git reads, or a command git runs.
+$GitPathKeys = '^(core\.(hookspath|excludesfile|attributesfile)|include(if\..*)?\.path)$'
+$GitCmdKeys = '^(core\.(fsmonitor|sshcommand|pager|editor|askpass)|sequence\.editor|gpg\.(.*\.)?program|(filter|diff|merge)\..*\.(clean|smudge|process|textconv|command|driver)|credential\.(.*\.)?helper)$'
+
+# True if $path, or any folder between it and $stopAt, is a symlink or junction.
+function Test-ReparseOnPath([string]$path, [string]$stopAt) {
+    $cur = $path.TrimEnd('\')
+    while ($cur -and $cur.Length -gt $stopAt.TrimEnd('\').Length) {
+        $item = Get-Item -LiteralPath $cur -Force -ErrorAction SilentlyContinue
+        if ($item -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { return $true }
+        $cur = Split-Path $cur -Parent
+    }
+    return $false
+}
+
+# Config files git reads for one git metadata entry. For a .git file (worktree or submodule)
+# that is the config where it points, plus the shared common dir.
+function Get-GitConfigFiles([string]$g) {
+    $top = $g
+    if ((Split-Path $g -Leaf) -ieq '.git') { $top = Split-Path $g -Parent }
+    $gd = $g
+    if (Test-Path -LiteralPath $g -PathType Leaf) {
+        $first = Get-Content -LiteralPath $g -TotalCount 1
+        if ("$first" -notmatch '^gitdir:\s*(.+)$') { return }
+        $gd = $Matches[1].Trim()
+        if (-not [IO.Path]::IsPathRooted($gd)) { $gd = Join-Path $top $gd }
+    }
+    $dirs = @($gd)
+    $cdf = Join-Path $gd 'commondir'
+    if (Test-Path -LiteralPath $cdf -PathType Leaf) {
+        $cd = "$(Get-Content -LiteralPath $cdf -TotalCount 1)".Trim()
+        if (-not [IO.Path]::IsPathRooted($cd)) { $cd = Join-Path $gd $cd }
+        $dirs += $cd
+    }
+    foreach ($d in $dirs) {
+        foreach ($f in @('config', 'config.worktree')) {
+            $c = Join-Path $d $f
+            if (Test-Path -LiteralPath $c -PathType Leaf) { [pscustomobject]@{ Cfg = $c; Top = $top } }
+        }
+    }
+}
+
+# Paths inside the project that git config (followed through every include) tells git to run
+# or read, such as a husky .husky folder or a script named by core.fsmonitor. Read with
+# git config --file, which runs nothing. Returns paths, or "SYMLINK<TAB>path" when a symlink or
+# junction sits on the path, because the agent could swap it.
 function Get-GitConfigTargets([string]$project, [string[]]$entries) {
     $ic = [StringComparison]::OrdinalIgnoreCase
     $out = @()
     foreach ($g in $entries) {
-        $cfg = Join-Path $g 'config'
-        if (-not (Test-Path -LiteralPath $cfg -PathType Leaf)) { continue }
-        $pairs = @()
-        foreach ($v in @(& git config --file $cfg --get-all core.hooksPath 2>$null)) { $pairs += ,@((Split-Path $g -Parent), $v) }
-        foreach ($line in @(& git config --file $cfg --get-regexp '^include(if\..*)?\.path$' 2>$null)) {
-            $pairs += ,@($g, ($line -split '\s+', 2)[1])
-        }
-        foreach ($pr in $pairs) {
-            $v = "$($pr[1])".Trim()
-            if (-not $v) { continue }
-            if ($v.StartsWith('~/')) { $p = Join-Path $env:USERPROFILE $v.Substring(2) }
-            elseif ([IO.Path]::IsPathRooted($v)) { $p = $v }
-            else { $p = Join-Path $pr[0] $v }
-            $p = [IO.Path]::GetFullPath($p).TrimEnd('\', '/')
-            if (($p + '\').StartsWith($project + '\', $ic)) { $out += $p }
+        foreach ($cf in @(Get-GitConfigFiles $g)) {
+            # Forward slashes, so git does not quote the origin paths it prints.
+            $lines = @(& git config --file $cf.Cfg.Replace('\', '/') --includes --show-origin --get-regexp "$GitPathKeys|$GitCmdKeys" 2>$null)
+            foreach ($line in $lines) {
+                $parts = "$line" -split "`t", 2
+                if ($parts.Count -lt 2) { continue }
+                $origin = $parts[0] -replace '^file:', ''
+                if ($origin.StartsWith('"') -and $origin.EndsWith('"')) { $origin = $origin.Trim('"').Replace('\\', '\') }
+                $key = ($parts[1] -split ' ', 2)[0]
+                $val = if (($parts[1] -split ' ', 2).Count -gt 1) { ($parts[1] -split ' ', 2)[1].Trim() } else { '' }
+                if ($key -match $GitPathKeys) { $toks = @($val) }
+                else { $toks = @(($val -replace '["'']', '') -split '\s+' | Where-Object { $_ }) }
+                foreach ($tok in $toks) {
+                    if (-not $tok) { continue }
+                    if ($tok.StartsWith('~/')) { $p = Join-Path $env:USERPROFILE $tok.Substring(2) }
+                    elseif ([IO.Path]::IsPathRooted($tok)) { $p = $tok }
+                    elseif ($key -like 'include*') { $p = Join-Path (Split-Path $origin -Parent) $tok }
+                    else { $p = Join-Path $cf.Top $tok }
+                    $exists = Test-Path -LiteralPath $p
+                    if (-not $exists -and $key -notmatch '^(core\.hookspath|include)') { continue }
+                    try { $full = [IO.Path]::GetFullPath($p).TrimEnd('\', '/') } catch { continue }
+                    if (-not ($full + '\').StartsWith($project + '\', $ic)) { continue }
+                    if ($exists -and (Test-ReparseOnPath $full $project)) { $out += "SYMLINK`t$full"; continue }
+                    $out += $full
+                }
+            }
         }
     }
     $out | Sort-Object -Unique

@@ -93,6 +93,8 @@ It reports whether the agent found the canary key, and whether it got an answer 
 - A coding agent reading `~/.aws`, because it is not in the agent's container.
 - A coding agent changing git metadata to plant a hook or `fsmonitor` setting that later runs on your machine. Every `.git` (any letter case) and every bare repository in the project is mounted read-only. If the agent creates new git metadata anywhere, `emu agent` names it in red when the agent exits, because `git diff` cannot show it.
 - An agent finding AWS keys you left in the project, including in git history. `emu agent` refuses to start until they are gone.
+- An agent editing a file that git config tells your machine to run or read, such as a husky `.husky` folder, an included config file, or a script named by `core.fsmonitor` or a diff or filter driver. `emu-guard` reads every config git would read (worktrees and nested includes too) without running anything, mounts those paths read-only, and refuses to start if a symlink or junction sits on one of them. Commands in config are checked word by word, so a script reached some other way (for example through a shell variable) is not caught.
+- Running `emu agent` from your home folder, a folder above it, `~/.aws` or `~/.ssh`, including when a symlink or junction hides that. (Bash resolves the real path; Windows refuses any junction on the project path.)
 
 **It does not stop:**
 

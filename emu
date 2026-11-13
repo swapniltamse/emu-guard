@@ -261,24 +261,78 @@ find_project_secrets() {
   return 0
 }
 
-# Paths that a repo's own config tells git to run or read: core.hooksPath (husky uses .husky)
-# and include.path. Read with --file, which runs nothing. Prints each target that sits inside
-# the project, so it can be mounted read-only. $1 = project, stdin = git metadata folders.
+is_abs() { case "$1" in /*|[A-Za-z]:[/\\]*) return 0 ;; esac; return 1; }
+
+# Config files git reads for one git metadata entry, as "configfile<TAB>top". For a .git file
+# (worktree or submodule) that is the config where it points, plus the shared common dir.
+git_config_files() {
+  local g="$1" top gd cd
+  case "$(basename "$g" | tr 'A-Z' 'a-z')" in .git) top="$(dirname "$g")" ;; *) top="$g" ;; esac
+  if [ -f "$g" ]; then
+    gd="$(sed -n 's/^gitdir:[[:space:]]*//p' "$g" | head -n1 | tr -d '\r')"
+    [ -n "$gd" ] || return 0
+    is_abs "$gd" || gd="$top/$gd"
+  else
+    gd="$g"
+  fi
+  [ -f "$gd/config" ] && printf '%s\t%s\n' "$gd/config" "$top"
+  [ -f "$gd/config.worktree" ] && printf '%s\t%s\n' "$gd/config.worktree" "$top"
+  if [ -f "$gd/commondir" ]; then
+    cd="$(head -n1 "$gd/commondir" | tr -d '\r')"
+    is_abs "$cd" || cd="$gd/$cd"
+    [ -f "$cd/config" ] && printf '%s\t%s\n' "$cd/config" "$top"
+  fi
+  return 0
+}
+
+# Config keys whose value is a path git reads, or a command git runs.
+GIT_PATH_KEYS='^(core\.(hookspath|excludesfile|attributesfile)|include(if\..*)?\.path)$'
+GIT_CMD_KEYS='^(core\.(fsmonitor|sshcommand|pager|editor|askpass)|sequence\.editor|gpg\.(.*\.)?program|(filter|diff|merge)\..*\.(clean|smudge|process|textconv|command|driver)|credential\.(.*\.)?helper)$'
+
+# Paths inside the project that git config (followed through every include) tells git to run
+# or read, such as a husky .husky folder or a script named by core.fsmonitor. Read with
+# git config --file, which runs nothing. Prints one path per line, or "SYMLINK<TAB>path" when a
+# symlink sits on the path, because the agent could swap the link. $1 = project, stdin = git entries.
+# One spelling per path: Git Bash on Windows can name one folder two ways (/tmp and /c/...).
+winform() { if command -v cygpath >/dev/null 2>&1; then cygpath -m "$1"; else printf '%s' "$1"; fi; }
 git_config_targets() {
-  local project="$1" g cfg base v p
+  local project="$1" g cfg top line origin key val tok p projw pw
+  projw="$(winform "$project")"
   while IFS= read -r g; do
-    [ -n "$g" ] && [ -f "$g/config" ] || continue
-    cfg="$g/config"; base="$(dirname "$g")"
-    {
-      git config --file "$cfg" --get-all core.hooksPath 2>/dev/null | sed "s|^|$base\t|"
-      git config --file "$cfg" --get-regexp '^include(if\..*)?\.path$' 2>/dev/null | awk '{print $2}' | sed "s|^|$g\t|"
-    } | while IFS="$(printf '\t')" read -r rel v; do
-      case "$v" in /*) p="$v" ;; "~"/*) p="$HOME/${v#\~/}" ;; *) p="$rel/$v" ;; esac
-      # Resolve .. and symlinks when the path exists, so the inside-the-project test is exact.
-      if [ -d "$p" ]; then p="$(cd "$p" && pwd -P)"
-      elif [ -e "$p" ]; then p="$(cd "$(dirname "$p")" && pwd -P)/$(basename "$p")"
-      fi
-      case "$p/" in "$project/"*) echo "$p" ;; esac
+    [ -n "$g" ] || continue
+    git_config_files "$g" | while IFS="$(printf '\t')" read -r cfg top; do
+      git config --file "$cfg" --includes --show-origin --get-regexp "$GIT_PATH_KEYS|$GIT_CMD_KEYS" 2>/dev/null \
+        | while IFS="$(printf '\t')" read -r origin line; do
+          origin="${origin#file:}"; key="${line%% *}"; val="${line#* }"
+          if printf '%s' "$key" | grep -qiE "$GIT_PATH_KEYS"; then
+            set -- "$val"
+          else
+            # A command: check each word that could be a file path.
+            # shellcheck disable=SC2086
+            set -- $(printf '%s' "$val" | tr -d "\"'")
+          fi
+          for tok in "$@"; do
+            case "$tok" in "~"/*) p="$HOME/${tok#\~/}" ;; *) p="$tok" ;; esac
+            if ! is_abs "$p"; then
+              case "$key" in include*) p="$(dirname "$origin")/$p" ;; *) p="$top/$p" ;; esac
+            fi
+            [ -e "$p" ] || { case "$key" in core.hookspath|include*) ;; *) continue ;; esac; }
+            if [ -e "$p" ]; then
+              local logical physical
+              if [ -d "$p" ]; then logical="$(cd -L "$p" && pwd -L)"; physical="$(cd -P "$p" && pwd -P)"
+              else logical="$(cd -L "$(dirname "$p")" && pwd -L)/$(basename "$p")"
+                   physical="$(cd -P "$(dirname "$p")" && pwd -P)/$(basename "$p")"
+                   [ -L "$p" ] && physical="LINK"
+              fi
+              case "$(winform "$logical")/" in "$projw/"*)
+                [ "$(winform "$logical")" = "$(winform "$physical")" ] || { printf 'SYMLINK\t%s\n' "$logical"; continue; } ;;
+              esac
+              p="$physical"
+            fi
+            pw="$(winform "$p")"
+            case "$pw/" in "$projw/"*) echo "$project${pw#"$projw"}" ;; esac
+          done
+        done
     done
   done
 }
@@ -312,6 +366,7 @@ cmd_agent() {
   project="$(pwd -P)"
   # The project must not be, or contain, your home folder or its key folders.
   local home_real; home_real="$(cd "$HOME" && pwd -P)"
+  project="${project%/}"   # "/" becomes "", so the root folder also counts as containing home
   case "$home_real/" in "$project/"*) fail "BLOCKED. This folder contains your home folder ($home_real). Run emu agent from a project folder." 5 ;; esac
   case "$project/" in "$home_real/.aws/"*|"$home_real/.ssh/"*) fail "BLOCKED. Do not run emu agent inside ~/.aws or ~/.ssh." 5 ;; esac
   hits="$(find_project_secrets "$project")"
@@ -337,6 +392,7 @@ $hits
   targets="$(printf '%s\n' "$before" | git_config_targets "$project" | sort -u)"
   while IFS= read -r t; do
     [ -n "$t" ] || continue
+    case "$t" in SYMLINK*) fail "BLOCKED. Git config uses '${t#SYMLINK?}', which goes through a symlink the agent could replace. Use a real folder or file there." 5 ;; esac
     [ -e "$t" ] || fail "BLOCKED. Git config points at '$t', which does not exist, so the agent could create it. Create it or remove the setting." 5
     case "$t" in *,*) fail "BLOCKED. Cannot mount '$t' read-only (comma in path)." 5 ;; esac
     git_ro+=(--mount "type=bind,src=$t,dst=/work${t#"$project"},readonly")

@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How this page was built | emu-guard</title>
+<meta name="robots" content="noindex">
+<link rel="preconnect" href="https://api.fontshare.com">
+<link rel="stylesheet" href="https://api.fontshare.com/v2/css?f[]=clash-grotesk@500,600&f[]=sentient@400,500,400i&display=swap">
+<style>
+:root {
+  --font-head: 'Clash Grotesk', 'Helvetica Neue', Arial, sans-serif;
+  --font-body: 'Sentient', Georgia, 'Times New Roman', serif;
+  --font-mono: ui-monospace, 'Cascadia Code', Consolas, monospace;
+  --ink: #16181d; --muted: #5b616e; --paper: #f6f4ef; --card: #ffffff; --line: #e3e0d8; --accent: #1f47c9;
+  --measure: 64ch;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --ink: #ecebe7; --muted: #a3a8b3; --paper: #121418; --card: #1b1e24; --line: #2b2f37; --accent: #7f9bff; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--paper); color: var(--ink); font: 400 17px/1.65 var(--font-body); font-variant-numeric: lining-nums; }
+main { max-width: var(--measure); margin: 0 auto; padding: 56px 20px; }
+a { color: var(--accent); text-underline-offset: 3px; }
+.eyebrow { font: 600 13px/1.2 var(--font-head); letter-spacing: 0.12em; text-transform: uppercase; color: var(--accent); margin: 0 0 16px; }
+h1 { font: 600 clamp(32px, 6vw, 44px)/1.08 var(--font-head); letter-spacing: -0.01em; margin: 0 0 24px; }
+h2 { font: 600 22px/1.2 var(--font-head); letter-spacing: 0; margin: 32px 0 8px; }
+ul { padding-left: 20px; }
+li { margin-bottom: 8px; }
+code { font-family: var(--font-mono); font-size: 0.86em; background: var(--card); border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; }
+.foot { margin-top: 40px; padding-top: 16px; border-top: 1px solid var(--line); font-size: 15px; color: var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <p class="eyebrow">Colophon</p>
+  <h1>How this page and emu-guard were built</h1>
+
+  <h2>The page</h2>
+  <ul>
+    <li>It is one static HTML file with its own CSS. There is no framework and no build step.</li>
+    <li>It has no tracking, no analytics and no cookies. The only outside request loads the fonts from Fontshare.</li>
+    <li>The small script on the page adds the copy buttons. Everything else works without it.</li>
+    <li>Headings use Clash Grotesk and body text uses Sentient. Icons come from Tabler Icons.</li>
+    <li>The share image is drawn from HTML and saved as a PNG.</li>
+  </ul>
+
+  <h2>The support table</h2>
+  <ul>
+    <li>The scores come from the per-test scores file that AWS published with AWS Emulator v1.0.341, <code>scores.json.gz</code>.</li>
+    <li>Only the behavioral fidelity tests count, as the AWS docs describe them.</li>
+    <li>AWS does not publish control plane and data plane scores separately. They come from joining each test result to its plane label in the public test manifest.</li>
+    <li>The full method and every service are in the <a href="https://github.com/swapniltamse/emu-guard/blob/main/docs/fidelity-snapshot.md">fidelity snapshot</a>.</li>
+  </ul>
+
+  <h2>The tool</h2>
+  <ul>
+    <li>emu-guard is one PowerShell script, one bash script, two Dockerfiles and a test.</li>
+    <li>It does not change AWS Emulator. It starts the emulator and checks each run before your command starts.</li>
+    <li>It was tested on Windows 11 with Docker Desktop. The bash script is not yet run on macOS or Linux.</li>
+  </ul>
+
+  <p>Built with Claude Code, reviewed by Swapnil Tamse.</p>
+
+  <p class="foot"><a href="../">Back to the guide</a>. <a href="https://github.com/swapniltamse/emu-guard">emu-guard on GitHub</a>. Not affiliated with AWS.</p>
+</main>
+</body>
+</html>

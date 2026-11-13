@@ -1,0 +1,6 @@
+node_modules/
+__pycache__/
+*.jsonl
+.env
+.env.*
+.claude.json

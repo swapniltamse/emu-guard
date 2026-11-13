@@ -1,0 +1,20 @@
+# emu-guard
+
+> A small PowerShell and bash script around AWS Emulator, the local AWS stand-in that AWS released in September 2026. It starts the emulator with one command on Windows, macOS and Linux, and checks that AWS calls reach the emulator's fake account, 000000000000, before your tests or your coding agent run.
+
+Commands: `emu up`, `emu run -- npm test`, `emu down`. On Windows: `.\emu.cmd up`.
+
+Key facts:
+
+- `emu run` refuses to start if real AWS key variables are set (exit 5), if the project uses an AWS SDK that ignores AWS_ENDPOINT_URL (exit 7), or if the account check fails (exit 4).
+- `emu agent` runs Claude Code in a container without your home folder or `~/.aws`.
+- Tested on Windows 11 with Docker Desktop. The bash script is not yet run on macOS or Linux.
+- Escape test results are not published yet.
+- Not affiliated with AWS. MIT license.
+
+## Links
+
+- [Repository](https://github.com/swapniltamse/emu-guard): Source code and README
+- [Fidelity snapshot](https://github.com/swapniltamse/emu-guard/blob/main/docs/fidelity-snapshot.md): AWS Emulator v1.0.341 scores per service
+- [AWS Emulator releases](https://github.com/aws/aws-emulator/releases)
+- [AWS SDK endpoint settings](https://docs.aws.amazon.com/sdkref/latest/guide/feature-ss-endpoints.html)

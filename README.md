@@ -10,6 +10,8 @@ Give your coding agent a fake AWS, not your real one.
 It is not a new emulator, and it does not wrap the emulator's API. It is one script per shell, two Dockerfiles and a test.
 
 > Status: early. Tested on Windows 11 with Docker Desktop. See [Tested on](#tested-on).
+>
+> Step-by-step guide with a support table: https://emu.swapniltamse.com
 
 ## Why
 

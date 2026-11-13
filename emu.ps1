@@ -307,22 +307,24 @@ function Invoke-Run([string[]]$rest) {
 # Lists files under $dir that look like they hold AWS keys. Prints paths only, never contents.
 # Scans everything that gets mounted, including node_modules and .git.
 # Also scans git history. AWS's documented example key and emu-guard's own canary are allowed.
-$KeyPatterns = @('(AKIA|ASIA)[0-9A-Z]{16}', 'aws_secret_access_key\s*=')
+$KeyPatterns = '(AKIA|ASIA)[0-9A-Z]{16}|aws_secret_access_key\s*=\s*\S*'
+# Each match is checked on its own, so an example key on the same line cannot hide a real one.
+function Test-RealKey($m) { @($m.Matches | Where-Object { $_.Value -notmatch $KeyAllow }).Count -gt 0 }
 $KeyAllow = 'EXAMPLE|EMUGUARDCANARY'
 function Find-ProjectSecrets([string]$dir) {
     $hits = @()
     $files = @(Get-ChildItem -Path $dir -Recurse -File -Force -ErrorAction SilentlyContinue)
     Say "Scanning $($files.Count) files and the git history for AWS keys before the agent can see them..."
     foreach ($f in $files) {
-        $m = Select-String -Path $f.FullName -Pattern $KeyPatterns -ErrorAction SilentlyContinue |
-            Where-Object { $_.Line -notmatch $KeyAllow } | Select-Object -First 1
+        $m = Select-String -Path $f.FullName -Pattern $KeyPatterns -AllMatches -ErrorAction SilentlyContinue |
+            Where-Object { Test-RealKey $_ } | Select-Object -First 1
         if ($m) { $hits += $f.FullName }
     }
     if ((Test-Path (Join-Path $dir '.git')) -and (Get-Command git -ErrorAction SilentlyContinue)) {
         # Plumbing only: cat-file prints every stored object as-is. Unlike git log, it runs no diff
         # drivers, signature checks, filters or pager, so repo config cannot make it run a command.
-        $h = & git -c core.fsmonitor=false -C $dir cat-file --batch-all-objects --batch 2>$null | Select-String -Pattern $KeyPatterns |
-            Where-Object { $_.Line -notmatch $KeyAllow } | Select-Object -First 1
+        $h = & git -c core.fsmonitor=false -C $dir cat-file --batch-all-objects --batch 2>$null | Select-String -Pattern $KeyPatterns -AllMatches |
+            Where-Object { Test-RealKey $_ } | Select-Object -First 1
         if ($h) { $hits += "$(Join-Path $dir '.git') (a key appears in git history)" }
     }
     return $hits
@@ -341,6 +343,11 @@ function Assert-AgentReady {
 function Invoke-Agent([string[]]$rest) {
     Assert-AgentReady
     $project = [IO.Path]::GetFullPath((Get-Location).ProviderPath).TrimEnd('\', '/')
+    # The project must not be, or contain, your home folder or its key folders.
+    $homeReal = [IO.Path]::GetFullPath($env:USERPROFILE).TrimEnd('\', '/')
+    $ic = [StringComparison]::OrdinalIgnoreCase
+    if (($homeReal + '\').StartsWith($project + '\', $ic)) { Fail "BLOCKED. This folder contains your home folder ($homeReal). Run emu agent from a project folder." 5 }
+    if (($project + '\').StartsWith("$homeReal\.aws\", $ic) -or ($project + '\').StartsWith("$homeReal\.ssh\", $ic)) { Fail 'BLOCKED. Do not run emu agent inside ~/.aws or ~/.ssh.' 5 }
     $hits = @(Find-ProjectSecrets $project)
     if ($hits.Count -gt 0) {
         Fail ("BLOCKED. These files in the project look like they hold AWS keys, and the agent would see them:`n     " +
@@ -359,6 +366,14 @@ function Invoke-Agent([string[]]$rest) {
         if ($g.Contains(',')) { Fail "BLOCKED. Cannot mount '$g' read-only (comma in path). Rename it, then try again." 5 }
         $rel = $g.Substring($project.Length).Replace('\', '/')
         $runArgs += @('--mount', "type=bind,src=$g,dst=/work$rel,readonly")
+    }
+    # Hook folders and included config files inside the project are read-only too.
+    foreach ($t in @(Get-GitConfigTargets $project $before)) {
+        if (-not (Test-Path -LiteralPath $t)) { Fail "BLOCKED. Git config points at '$t', which does not exist, so the agent could create it. Create it or remove the setting." 5 }
+        if ($t.Contains(',')) { Fail "BLOCKED. Cannot mount '$t' read-only (comma in path)." 5 }
+        $rel = $t.Substring($project.Length).Replace('\', '/')
+        $runArgs += @('--mount', "type=bind,src=$t,dst=/work$rel,readonly")
+        Say "Read-only because git config uses it: $($rel.TrimStart('/'))"
     }
     if (-not (Test-Path (Join-Path $project '.git'))) {
         Warn "This folder is not a git repository, so you cannot review the agent's changes with git diff."
@@ -380,6 +395,32 @@ function Invoke-Agent([string[]]$rest) {
     }
     Warn "The agent could edit any file in $project. Review its changes (git diff) before you run them outside the container."
     exit $code
+}
+
+# Paths that a repo's own config tells git to run or read: core.hooksPath (husky uses .husky)
+# and include.path. Read with --file, which runs nothing. Returns targets inside the project.
+function Get-GitConfigTargets([string]$project, [string[]]$entries) {
+    $ic = [StringComparison]::OrdinalIgnoreCase
+    $out = @()
+    foreach ($g in $entries) {
+        $cfg = Join-Path $g 'config'
+        if (-not (Test-Path -LiteralPath $cfg -PathType Leaf)) { continue }
+        $pairs = @()
+        foreach ($v in @(& git config --file $cfg --get-all core.hooksPath 2>$null)) { $pairs += ,@((Split-Path $g -Parent), $v) }
+        foreach ($line in @(& git config --file $cfg --get-regexp '^include(if\..*)?\.path$' 2>$null)) {
+            $pairs += ,@($g, ($line -split '\s+', 2)[1])
+        }
+        foreach ($pr in $pairs) {
+            $v = "$($pr[1])".Trim()
+            if (-not $v) { continue }
+            if ($v.StartsWith('~/')) { $p = Join-Path $env:USERPROFILE $v.Substring(2) }
+            elseif ([IO.Path]::IsPathRooted($v)) { $p = $v }
+            else { $p = Join-Path $pr[0] $v }
+            $p = [IO.Path]::GetFullPath($p).TrimEnd('\', '/')
+            if (($p + '\').StartsWith($project + '\', $ic)) { $out += $p }
+        }
+    }
+    $out | Sort-Object -Unique
 }
 
 # Git metadata that git on your machine would obey: any .git in any letter case (Windows

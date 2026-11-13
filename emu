@@ -242,21 +242,45 @@ $old_sdks
 # Prints files under $1 that look like they hold AWS keys. Paths only, never contents.
 # Scans everything that gets mounted, including node_modules, .git and git history.
 # Binary files are skipped. AWS's documented example key and emu-guard's own canary are allowed.
-KEY_PATTERN='(AKIA|ASIA)[0-9A-Z]{16}|aws_secret_access_key[[:space:]]*='
+KEY_PATTERN='(AKIA|ASIA)[0-9A-Z]{16}|aws_secret_access_key[[:space:]]*=[[:space:]]*[^[:space:]]*'
 KEY_ALLOW='EXAMPLE|EMUGUARDCANARY'
+# True if stdin holds a key that is not on the allow list. Each match is checked on its own,
+# so an example key on the same line cannot hide a real one.
+has_real_key() { grep -aoE "$KEY_PATTERN" | grep -avE "$KEY_ALLOW" | grep -q .; }
 find_project_secrets() {
   grep -rIlE "$KEY_PATTERN" "$1" 2>/dev/null \
     | while read -r f; do
-        grep -E "$KEY_PATTERN" "$f" | grep -qvE "$KEY_ALLOW" && echo "$f"
+        has_real_key < "$f" && echo "$f"
       done
   if [ -e "$1/.git" ] && command -v git >/dev/null 2>&1; then
     # Plumbing only: cat-file prints every stored object as-is. Unlike git log, it runs no diff
     # drivers, signature checks, filters or pager, so repo config cannot make it run a command.
     git -c core.fsmonitor=false -C "$1" cat-file --batch-all-objects --batch 2>/dev/null \
-      | grep -aE "$KEY_PATTERN" | grep -aqvE "$KEY_ALLOW" \
-      && echo "$1/.git (a key appears in git history)"
+      | has_real_key && echo "$1/.git (a key appears in git history)"
   fi
   return 0
+}
+
+# Paths that a repo's own config tells git to run or read: core.hooksPath (husky uses .husky)
+# and include.path. Read with --file, which runs nothing. Prints each target that sits inside
+# the project, so it can be mounted read-only. $1 = project, stdin = git metadata folders.
+git_config_targets() {
+  local project="$1" g cfg base v p
+  while IFS= read -r g; do
+    [ -n "$g" ] && [ -f "$g/config" ] || continue
+    cfg="$g/config"; base="$(dirname "$g")"
+    {
+      git config --file "$cfg" --get-all core.hooksPath 2>/dev/null | sed "s|^|$base\t|"
+      git config --file "$cfg" --get-regexp '^include(if\..*)?\.path$' 2>/dev/null | awk '{print $2}' | sed "s|^|$g\t|"
+    } | while IFS="$(printf '\t')" read -r rel v; do
+      case "$v" in /*) p="$v" ;; "~"/*) p="$HOME/${v#\~/}" ;; *) p="$rel/$v" ;; esac
+      # Resolve .. and symlinks when the path exists, so the inside-the-project test is exact.
+      if [ -d "$p" ]; then p="$(cd "$p" && pwd -P)"
+      elif [ -e "$p" ]; then p="$(cd "$(dirname "$p")" && pwd -P)/$(basename "$p")"
+      fi
+      case "$p/" in "$project/"*) echo "$p" ;; esac
+    done
+  done
 }
 
 # Git metadata that git on your machine would obey: any .git in any letter case, and any
@@ -285,7 +309,11 @@ assert_agent_ready() {
 cmd_agent() {
   assert_agent_ready
   local project hits
-  project="$(pwd)"
+  project="$(pwd -P)"
+  # The project must not be, or contain, your home folder or its key folders.
+  local home_real; home_real="$(cd "$HOME" && pwd -P)"
+  case "$home_real/" in "$project/"*) fail "BLOCKED. This folder contains your home folder ($home_real). Run emu agent from a project folder." 5 ;; esac
+  case "$project/" in "$home_real/.aws/"*|"$home_real/.ssh/"*) fail "BLOCKED. Do not run emu agent inside ~/.aws or ~/.ssh." 5 ;; esac
   hits="$(find_project_secrets "$project")"
   if [ -n "$hits" ]; then
     fail "BLOCKED. These files in the project look like they hold AWS keys, and the agent would see them:
@@ -304,6 +332,16 @@ $hits
     [ -e "$g" ] || fail "BLOCKED. Unusual path name near '$g'. Rename it, then try again." 5
     git_ro+=(--mount "type=bind,src=$g,dst=/work${g#"$project"},readonly")
   done <<< "$before"
+  # Hook folders and included config files inside the project are read-only too.
+  local targets t
+  targets="$(printf '%s\n' "$before" | git_config_targets "$project" | sort -u)"
+  while IFS= read -r t; do
+    [ -n "$t" ] || continue
+    [ -e "$t" ] || fail "BLOCKED. Git config points at '$t', which does not exist, so the agent could create it. Create it or remove the setting." 5
+    case "$t" in *,*) fail "BLOCKED. Cannot mount '$t' read-only (comma in path)." 5 ;; esac
+    git_ro+=(--mount "type=bind,src=$t,dst=/work${t#"$project"},readonly")
+    say "Read-only because git config uses it: ${t#"$project"/}"
+  done <<< "$targets"
   if [ ! -e "$project/.git" ]; then
     warn "This folder is not a git repository, so you cannot review the agent's changes with git diff."
   else

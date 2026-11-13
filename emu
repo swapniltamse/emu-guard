@@ -344,7 +344,13 @@ git_config_targets() {
             else logical="$(cd -L "$(dirname "$p")" && pwd -L)/$(basename "$p")"; fi
             lw="$(winform "$logical")"; pw="$(winform "$(real_path "$p")")"
             case "$lw/" in "$projw/"*) [ "$lw" = "$pw" ] || { printf 'SYMLINK\t%s\n' "$logical"; continue; } ;; esac
-            [ "$pw" = "$projw" ] && continue   # never the project root itself
+            if [ "$pw" = "$projw" ]; then
+              # The project root itself: harmless for core.worktree, but a hooks folder or a
+              # command there would let the agent drop a file that git runs. Fail closed.
+              case "$key" in core.worktree) ;; *) printf 'ROOT	%s
+' "$key" ;; esac
+              continue
+            fi
             case "$pw/" in "$projw/"*) echo "$project${pw#"$projw"}" ;; esac
           else
             # A risky key naming a path-like word inside the project that does not exist:
@@ -416,6 +422,7 @@ $hits
   targets="$(printf '%s\n' "$before" | git_config_targets "$project" | sort -u)"
   while IFS= read -r t; do
     [ -n "$t" ] || continue
+    case "$t" in ROOT*) fail "BLOCKED. Git config setting '${t#ROOT?}' points at the project folder itself, so any file the agent adds there could run. Point it at a subfolder." 5 ;; esac
     case "$t" in MISSING*) fail "BLOCKED. Git config names '${t#MISSING?}' inside the project, but it does not exist, so the agent could create it. Create it or remove the setting." 5 ;; esac
     case "$t" in SYMLINK*) fail "BLOCKED. Git config uses '${t#SYMLINK?}', which goes through a symlink the agent could replace. Use a real folder or file there." 5 ;; esac
     [ -e "$t" ] || fail "BLOCKED. Git config points at '$t', which does not exist, so the agent could create it. Create it or remove the setting." 5
@@ -445,13 +452,18 @@ $hits
 # Shows what the agent changed, with every git feature that can run a program switched off:
 # no hooks, fsmonitor, pager, external diff or textconv, and bare repos only when named.
 cmd_review() {
-  local safe=(-c core.fsmonitor=false -c core.hooksPath=/dev/null -c diff.external= -c core.pager=cat
+  # --attr-source points at git's empty tree, so no .gitattributes applies and no filter or
+  # diff driver is picked, even in a repo the agent wrote. Needs git 2.40 or later; older git
+  # rejects the flag and nothing runs.
+  local empty_tree=4b825dc642cb6eb9a060e54bf8d69288fbee4904
+  local safe=(--no-pager --attr-source="$empty_tree" -c core.fsmonitor=false -c core.hooksPath=/dev/null
+              -c diff.external= -c core.pager=cat -c core.attributesFile=/dev/null
               -c safe.bareRepository=explicit -c core.untrackedCache=false)
-  say "Safe review: git hooks, fsmonitor, pager and diff drivers are off for these commands."
-  git --no-pager "${safe[@]}" status --short --untracked-files=all || return $?
+  say "Safe review: git hooks, fsmonitor, filters, pager and diff drivers are off for these commands."
+  git "${safe[@]}" status --short --untracked-files=all --ignore-submodules=all     || fail "git refused the safe review flags (git 2.40 or later is needed). Nothing was run." 2
   echo
-  git --no-pager "${safe[@]}" diff --no-textconv --no-ext-diff --stat "$@"
-  git --no-pager "${safe[@]}" diff --no-textconv --no-ext-diff "$@"
+  git "${safe[@]}" diff --no-textconv --no-ext-diff --ignore-submodules=all --stat "$@"
+  git "${safe[@]}" diff --no-textconv --no-ext-diff --ignore-submodules=all "$@"
 }
 
 cmd_escape_test() {

@@ -374,6 +374,7 @@ function Invoke-Agent([string[]]$rest) {
     }
     # Hook folders and included config files inside the project are read-only too.
     foreach ($t in @(Get-GitConfigTargets $project $before)) {
+        if ($t.StartsWith("ROOT`t")) { Fail "BLOCKED. Git config setting '$($t.Substring(5))' points at the project folder itself, so any file the agent adds there could run. Point it at a subfolder." 5 }
         if ($t.StartsWith("MISSING`t")) { Fail "BLOCKED. Git config names $($t.Substring(8)) inside the project, but it does not exist, so the agent could create it. Create it or remove the setting." 5 }
         if ($t.StartsWith("SYMLINK`t")) { Fail "BLOCKED. Git config uses '$($t.Substring(8))', which goes through a symlink or junction the agent could replace. Use a real folder or file there." 5 }
         if (-not (Test-Path -LiteralPath $t)) { Fail "BLOCKED. Git config points at '$t', which does not exist, so the agent could create it. Create it or remove the setting." 5 }
@@ -507,7 +508,12 @@ function Get-GitConfigTargets([string]$project, [string[]]$entries) {
                         if (Test-Path -LiteralPath $full) {
                             $real = Resolve-RealPath $full
                             if (($full + '\').StartsWith($project + '\', $ic) -and (Test-ReparseOnPath $full $project)) { $out += "SYMLINK`t$full"; continue }
-                            if ($real -ieq $project) { continue }   # never the project root itself
+                            if ($real -ieq $project) {
+                                # The project root itself: harmless for core.worktree, but a hooks folder or a
+                                # command there would let the agent drop a file that git runs. Fail closed.
+                                if ($key -ne 'core.worktree') { $out += "ROOT`t$key" }
+                                continue
+                            }
                             if (($real + '\').StartsWith($project + '\', $ic)) { $out += $real }
                         } else {
                             # A risky key naming a path-like word inside the project that does not exist:
@@ -539,14 +545,19 @@ function Get-GitEntries([string]$dir) {
 # Shows what the agent changed, with every git feature that can run a program switched off:
 # no hooks, fsmonitor, pager, external diff or textconv, and bare repos only when named.
 function Invoke-Review([string[]]$paths) {
-    $safe = @('--no-pager', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=NUL', '-c', 'diff.external=',
-              '-c', 'core.pager=cat', '-c', 'safe.bareRepository=explicit', '-c', 'core.untrackedCache=false')
-    Say 'Safe review: git hooks, fsmonitor, pager and diff drivers are off for these commands.'
-    & git @safe status --short --untracked-files=all
-    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    # --attr-source points at git's empty tree, so no .gitattributes applies and no filter or
+    # diff driver is picked, even in a repo the agent wrote. Needs git 2.40 or later; older git
+    # rejects the flag and nothing runs.
+    $safe = @('--no-pager', '--attr-source=4b825dc642cb6eb9a060e54bf8d69288fbee4904',
+              '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=NUL', '-c', 'diff.external=',
+              '-c', 'core.pager=cat', '-c', 'core.attributesFile=NUL',
+              '-c', 'safe.bareRepository=explicit', '-c', 'core.untrackedCache=false')
+    Say 'Safe review: git hooks, fsmonitor, filters, pager and diff drivers are off for these commands.'
+    & git @safe status --short --untracked-files=all --ignore-submodules=all
+    if ($LASTEXITCODE -ne 0) { Fail 'git refused the safe review flags (git 2.40 or later is needed). Nothing was run.' 2 }
     Write-Host ''
-    & git @safe diff --no-textconv --no-ext-diff --stat @paths
-    & git @safe diff --no-textconv --no-ext-diff @paths
+    & git @safe diff --no-textconv --no-ext-diff --ignore-submodules=all --stat @paths
+    & git @safe diff --no-textconv --no-ext-diff --ignore-submodules=all @paths
     exit $LASTEXITCODE
 }
 

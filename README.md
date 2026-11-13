@@ -45,6 +45,7 @@ cd emu-guard
 | `emu run --strip -- CMD` | Same, but drop real-key variables from this one run instead of refusing. |
 | `emu agent` | Start Claude Code in a container that has no real AWS keys. |
 | `emu escape-test` | Ask an agent to reach your real AWS account, once without `emu-guard` and once with it. |
+| `emu review` | Show the agent's changes with every git feature that can run a program switched off. |
 | `emu status` | Show whether the emulator is up, and its version. |
 | `emu down` | Stop the emulator. Everything you created in it is gone. |
 
@@ -93,13 +94,14 @@ It reports whether the agent found the canary key, and whether it got an answer 
 - A coding agent reading `~/.aws`, because it is not in the agent's container.
 - A coding agent changing git metadata to plant a hook or `fsmonitor` setting that later runs on your machine. Every `.git` (any letter case) and every bare repository in the project is mounted read-only. If the agent creates new git metadata anywhere, `emu agent` names it in red when the agent exits, because `git diff` cannot show it.
 - An agent finding AWS keys you left in the project, including in git history. `emu agent` refuses to start until they are gone.
-- An agent editing a file that git config tells your machine to run or read, such as a husky `.husky` folder, an included config file, or a script named by `core.fsmonitor` or a diff or filter driver. `emu-guard` reads every config git would read (worktrees and nested includes too) without running anything, mounts those paths read-only, and refuses to start if a symlink or junction sits on one of them. Commands in config are checked word by word, so a script reached some other way (for example through a shell variable) is not caught.
+- An agent editing a file that git config tells your machine to run or read, such as a husky `.husky` folder, an included config file, or a script named by `core.fsmonitor`, an alias, or a diff or filter driver. `emu-guard` reads every config file git would read (worktrees, nested includes and conditional includes, whatever their condition) without running anything. Every word of every value that points into the project is mounted read-only. It refuses to start if a symlink or junction sits on one of those paths, or if a risky setting names a project path that does not exist yet (the agent could create it). Commands are checked word by word, so a script reached some other way, for example through a shell variable, is not caught.
+- Your own first look at the agent's work running something. `emu review` shows `git status` and `git diff` with hooks, fsmonitor, the pager, external diff and textconv switched off, whatever the repo's config says. Use it instead of plain `git status` after an agent run.
 - Running `emu agent` from your home folder, a folder above it, `~/.aws` or `~/.ssh`, including when a symlink or junction hides that. (Bash resolves the real path; Windows refuses any junction on the project path.)
 
 **It does not stop:**
 
 - **Code you run on your own machine with `emu run`.** The run's environment is clean, but your `~/.aws/credentials` file is still on disk, and code that opens it by path can read it. `emu run` guards against accidents. For code you do not trust, use `emu agent`.
-- **Changes the agent makes that you run later.** The agent can edit any file in the project, including tests and build scripts. Review its diff before you run it outside the container.
+- **Changes the agent makes that you run later.** The agent can edit any file in the project, including tests, `package.json` scripts and build files. Look at its changes with `emu review` before you run anything outside the container.
 - **Secrets that are not AWS keys.** The scan looks for AWS access keys and `aws_secret_access_key` lines, in files and in git history. A database password in `.env` gets past it.
 - **Data leaving through the network.** The agent container has internet access, because Claude Code needs it. `emu-guard` keeps AWS keys away from the agent. It does not stop the agent from sending your project files somewhere.
 - **Emulator gaps.** An operation the emulator does not support yet returns HTTP 501 `NotImplemented`. See [docs/fidelity-snapshot.md](docs/fidelity-snapshot.md).

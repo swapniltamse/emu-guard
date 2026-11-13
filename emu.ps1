@@ -41,6 +41,7 @@ emu-guard $EmuGuardVersion  (AWS Emulator on 127.0.0.1:$Port)
   emu agent [ARGS]           Claude Code in a container with no real AWS keys. Needs
                              CLAUDE_CODE_OAUTH_TOKEN (run 'claude setup-token') or ANTHROPIC_API_KEY
   emu escape-test            Ask an agent to reach real AWS, once naive and once with emu-guard
+  emu review [PATHS]         Show the agent's changes with git hooks, fsmonitor and diff drivers off
   emu status                 Is it up, which version
   emu down                   Stop the emulator. Emulated resources are dropped.
 
@@ -373,6 +374,7 @@ function Invoke-Agent([string[]]$rest) {
     }
     # Hook folders and included config files inside the project are read-only too.
     foreach ($t in @(Get-GitConfigTargets $project $before)) {
+        if ($t.StartsWith("MISSING`t")) { Fail "BLOCKED. Git config names $($t.Substring(8)) inside the project, but it does not exist, so the agent could create it. Create it or remove the setting." 5 }
         if ($t.StartsWith("SYMLINK`t")) { Fail "BLOCKED. Git config uses '$($t.Substring(8))', which goes through a symlink or junction the agent could replace. Use a real folder or file there." 5 }
         if (-not (Test-Path -LiteralPath $t)) { Fail "BLOCKED. Git config points at '$t', which does not exist, so the agent could create it. Create it or remove the setting." 5 }
         if ($t.Contains(',')) { Fail "BLOCKED. Cannot mount '$t' read-only (comma in path)." 5 }
@@ -398,13 +400,38 @@ function Invoke-Agent([string[]]$rest) {
             "`n     Do not run git in those folders until you have read their hooks\ and config, or deleted them." +
             "`n     Also consider: git config --global safe.bareRepository explicit") -ForegroundColor Red
     }
-    Warn "The agent could edit any file in $project. Review its changes (git diff) before you run them outside the container."
+    Warn "The agent could edit any file in $project. Review its changes with: emu review"
     exit $code
 }
 
-# Config keys whose value is a path git reads, or a command git runs.
-$GitPathKeys = '^(core\.(hookspath|excludesfile|attributesfile)|include(if\..*)?\.path)$'
-$GitCmdKeys = '^(core\.(fsmonitor|sshcommand|pager|editor|askpass)|sequence\.editor|gpg\.(.*\.)?program|(filter|diff|merge)\..*\.(clean|smudge|process|textconv|command|driver)|credential\.(.*\.)?helper)$'
+# Keys whose values are paths git reads, and key families whose values git may run.
+$GitPathKeys = '^(core\.(hookspath|excludesfile|attributesfile|worktree)|include(if\..*)?\.path)$'
+$GitRiskyKeys = '^(core\.|alias\.|pager\.|sequence\.|gpg\.|diff\.|filter\.|merge\.|credential\.|include|interactive\.|web\.|mergetool\.|difftool\.|uploadpack\.|receive\.|ssh\.)|\.(cmd|command|program|helper|path|driver|textconv|clean|smudge|process)$'
+
+# Real path of an existing file or folder, with every junction and symlink followed.
+function Resolve-RealPath([string]$path) {
+    $full = [IO.Path]::GetFullPath($path).TrimEnd('\')
+    for ($i = 0; $i -lt 40; $i++) {
+        $changed = $false
+        $root = [IO.Path]::GetPathRoot($full)
+        $parts = $full.Substring($root.Length).Split('\') | Where-Object { $_ }
+        $cur = $root.TrimEnd('\')
+        for ($j = 0; $j -lt $parts.Count; $j++) {
+            $cur = "$cur\$($parts[$j])"
+            $item = Get-Item -LiteralPath $cur -Force -ErrorAction SilentlyContinue
+            if ($item -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -and $item.Target) {
+                $t = @($item.Target)[0]
+                if (-not [IO.Path]::IsPathRooted($t)) { $t = Join-Path (Split-Path $cur -Parent) $t }
+                $rest = ($parts | Select-Object -Skip ($j + 1)) -join '\'
+                $full = [IO.Path]::GetFullPath($(if ($rest) { Join-Path $t $rest } else { $t })).TrimEnd('\')
+                $changed = $true
+                break
+            }
+        }
+        if (-not $changed) { return $full }
+    }
+    return $full
+}
 
 # True if $path, or any folder between it and $stopAt, is a symlink or junction.
 function Test-ReparseOnPath([string]$path, [string]$stopAt) {
@@ -444,38 +471,52 @@ function Get-GitConfigFiles([string]$g) {
     }
 }
 
-# Paths inside the project that git config (followed through every include) tells git to run
-# or read, such as a husky .husky folder or a script named by core.fsmonitor. Read with
-# git config --file, which runs nothing. Returns paths, or "SYMLINK<TAB>path" when a symlink or
-# junction sits on the path, because the agent could swap it.
+# Paths inside the project that git config tells git to read or run, such as a husky .husky
+# folder, an included config file, or a script named by core.fsmonitor or an alias. Every config
+# file is read with git config --file --list (which runs nothing), and every include and
+# includeIf is followed by hand, whatever its condition. Every word of every value is checked.
+# Returns paths; "SYMLINK<TAB>path" when the agent could swap a link or junction on the path;
+# "MISSING<TAB>path" when a risky key names a project path that does not exist yet.
 function Get-GitConfigTargets([string]$project, [string[]]$entries) {
     $ic = [StringComparison]::OrdinalIgnoreCase
     $out = @()
     foreach ($g in $entries) {
         foreach ($cf in @(Get-GitConfigFiles $g)) {
-            # Forward slashes, so git does not quote the origin paths it prints.
-            $lines = @(& git config --file $cf.Cfg.Replace('\', '/') --includes --show-origin --get-regexp "$GitPathKeys|$GitCmdKeys" 2>$null)
-            foreach ($line in $lines) {
-                $parts = "$line" -split "`t", 2
-                if ($parts.Count -lt 2) { continue }
-                $origin = $parts[0] -replace '^file:', ''
-                if ($origin.StartsWith('"') -and $origin.EndsWith('"')) { $origin = $origin.Trim('"').Replace('\\', '\') }
-                $key = ($parts[1] -split ' ', 2)[0]
-                $val = if (($parts[1] -split ' ', 2).Count -gt 1) { ($parts[1] -split ' ', 2)[1].Trim() } else { '' }
-                if ($key -match $GitPathKeys) { $toks = @($val) }
-                else { $toks = @(($val -replace '["'']', '') -split '\s+' | Where-Object { $_ }) }
-                foreach ($tok in $toks) {
-                    if (-not $tok) { continue }
-                    if ($tok.StartsWith('~/')) { $p = Join-Path $env:USERPROFILE $tok.Substring(2) }
-                    elseif ([IO.Path]::IsPathRooted($tok)) { $p = $tok }
-                    elseif ($key -like 'include*') { $p = Join-Path (Split-Path $origin -Parent) $tok }
-                    else { $p = Join-Path $cf.Top $tok }
-                    $exists = Test-Path -LiteralPath $p
-                    if (-not $exists -and $key -notmatch '^(core\.hookspath|include)') { continue }
-                    try { $full = [IO.Path]::GetFullPath($p).TrimEnd('\', '/') } catch { continue }
-                    if (-not ($full + '\').StartsWith($project + '\', $ic)) { continue }
-                    if ($exists -and (Test-ReparseOnPath $full $project)) { $out += "SYMLINK`t$full"; continue }
-                    $out += $full
+            $queue = New-Object System.Collections.Queue
+            $queue.Enqueue($cf.Cfg)
+            $seen = @{}
+            while ($queue.Count -gt 0) {
+                $f = [IO.Path]::GetFullPath($queue.Dequeue())
+                if ($seen.ContainsKey($f.ToLowerInvariant())) { continue }
+                $seen[$f.ToLowerInvariant()] = $true
+                foreach ($entry in @(& git config --file $f.Replace('\', '/') --list 2>$null)) {
+                    $eq = "$entry".IndexOf('=')
+                    if ($eq -lt 0) { $key = "$entry"; $val = '' } else { $key = "$entry".Substring(0, $eq); $val = "$entry".Substring($eq + 1) }
+                    $isPathKey = $key -match $GitPathKeys
+                    if ($isPathKey) { $toks = @($val) }
+                    else { $toks = @($val -split '[\s;&|()`$<>"''!=,]+' | Where-Object { $_ }) }
+                    foreach ($tok in $toks) {
+                        if (-not $tok -or $tok -match '://' -or $tok -match '^[^/\\]+@[^:]+:' -or $tok.StartsWith('-')) { continue }
+                        if ($tok.StartsWith('~/')) { $p = Join-Path $env:USERPROFILE $tok.Substring(2) }
+                        elseif ([IO.Path]::IsPathRooted($tok)) { $p = $tok }
+                        elseif ($key -like 'include*') { $p = Join-Path (Split-Path $f -Parent) $tok }
+                        else { $p = Join-Path $cf.Top $tok }
+                        try { $full = [IO.Path]::GetFullPath($p).TrimEnd('\', '/') } catch { continue }
+                        # Follow includes and conditional includes by hand.
+                        if ($key -like 'include*.path' -and (Test-Path -LiteralPath $full -PathType Leaf)) { $queue.Enqueue($full) }
+                        if (Test-Path -LiteralPath $full) {
+                            $real = Resolve-RealPath $full
+                            if (($full + '\').StartsWith($project + '\', $ic) -and (Test-ReparseOnPath $full $project)) { $out += "SYMLINK`t$full"; continue }
+                            if ($real -ieq $project) { continue }   # never the project root itself
+                            if (($real + '\').StartsWith($project + '\', $ic)) { $out += $real }
+                        } else {
+                            # A risky key naming a path-like word inside the project that does not exist:
+                            # the agent could create it, so fail closed.
+                            if (-not $isPathKey -and $tok -notmatch '[/\\]' -and -not $tok.StartsWith('.')) { continue }
+                            if ($key -notmatch $GitRiskyKeys) { continue }
+                            if (($full + '\').StartsWith($project + '\', $ic)) { $out += "MISSING`t$full" }
+                        }
+                    }
                 }
             }
         }
@@ -493,6 +534,20 @@ function Get-GitEntries([string]$dir) {
         Where-Object { $d = $_.DirectoryName; @('objects', 'refs', 'commondir', 'config') | Where-Object { Test-Path (Join-Path $d $_) } } |
         ForEach-Object { $_.DirectoryName }
     @($dotGit) + @($bare) | Where-Object { $_ -and $_ -notmatch '\\\.git\\' } | Sort-Object -Unique
+}
+
+# Shows what the agent changed, with every git feature that can run a program switched off:
+# no hooks, fsmonitor, pager, external diff or textconv, and bare repos only when named.
+function Invoke-Review([string[]]$paths) {
+    $safe = @('--no-pager', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=NUL', '-c', 'diff.external=',
+              '-c', 'core.pager=cat', '-c', 'safe.bareRepository=explicit', '-c', 'core.untrackedCache=false')
+    Say 'Safe review: git hooks, fsmonitor, pager and diff drivers are off for these commands.'
+    & git @safe status --short --untracked-files=all
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    Write-Host ''
+    & git @safe diff --no-textconv --no-ext-diff --stat @paths
+    & git @safe diff --no-textconv --no-ext-diff @paths
+    exit $LASTEXITCODE
 }
 
 function Invoke-EscapeTest {
@@ -549,6 +604,7 @@ switch ($sub) {
     'run'         { Invoke-Run $rest }
     'agent'       { Invoke-Agent $rest }
     'escape-test' { Invoke-EscapeTest }
+    'review'      { Invoke-Review $rest }
     'status'      { Invoke-Status }
     'version'     { Write-Host "emu-guard $EmuGuardVersion" }
     default       { Show-Help; if ($sub -and $sub -ne 'help' -and $sub -ne '--help' -and $sub -ne '-h') { exit 64 } }

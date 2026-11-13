@@ -32,6 +32,7 @@ emu-guard $EMU_GUARD_VERSION  (AWS Emulator on 127.0.0.1:$PORT)
   emu agent [ARGS]           Claude Code in a container with no real AWS keys. Needs
                              CLAUDE_CODE_OAUTH_TOKEN (run 'claude setup-token') or ANTHROPIC_API_KEY
   emu escape-test            Ask an agent to reach real AWS, once naive and once with emu-guard
+  emu review [PATHS]         Show the agent's changes with git hooks, fsmonitor and diff drivers off
   emu status                 Is it up, which version
   emu down                   Stop the emulator. Emulated resources are dropped.
 
@@ -285,54 +286,77 @@ git_config_files() {
   return 0
 }
 
-# Config keys whose value is a path git reads, or a command git runs.
-GIT_PATH_KEYS='^(core\.(hookspath|excludesfile|attributesfile)|include(if\..*)?\.path)$'
-GIT_CMD_KEYS='^(core\.(fsmonitor|sshcommand|pager|editor|askpass)|sequence\.editor|gpg\.(.*\.)?program|(filter|diff|merge)\..*\.(clean|smudge|process|textconv|command|driver)|credential\.(.*\.)?helper)$'
+# Keys whose values are paths git reads, and key families whose values git may run.
+GIT_PATH_KEYS='^(core\.(hookspath|excludesfile|attributesfile|worktree)|include(if\..*)?\.path)$'
+GIT_RISKY_KEYS='^(core\.|alias\.|pager\.|sequence\.|gpg\.|diff\.|filter\.|merge\.|credential\.|include|interactive\.|web\.|mergetool\.|difftool\.|uploadpack\.|receive\.|ssh\.)|\.(cmd|command|program|helper|path|driver|textconv|clean|smudge|process)$'
 
-# Paths inside the project that git config (followed through every include) tells git to run
-# or read, such as a husky .husky folder or a script named by core.fsmonitor. Read with
-# git config --file, which runs nothing. Prints one path per line, or "SYMLINK<TAB>path" when a
-# symlink sits on the path, because the agent could swap the link. $1 = project, stdin = git entries.
 # One spelling per path: Git Bash on Windows can name one folder two ways (/tmp and /c/...).
 winform() { if command -v cygpath >/dev/null 2>&1; then cygpath -m "$1"; else printf '%s' "$1"; fi; }
+
+# Real path of an existing file or folder, with every symlink followed.
+real_path() {
+  local p="$1" i=0 t
+  while [ -L "$p" ] && [ $i -lt 40 ]; do
+    t="$(readlink "$p")"; is_abs "$t" || t="$(dirname "$p")/$t"; p="$t"; i=$((i + 1))
+  done
+  if [ -d "$p" ]; then (cd -P "$p" && pwd -P); else printf '%s/%s' "$(cd -P "$(dirname "$p")" && pwd -P)" "$(basename "$p")"; fi
+}
+
+# Paths inside the project that git config tells git to read or run, such as a husky .husky
+# folder, an included config file, or a script named by core.fsmonitor or an alias. Every config
+# file is read with git config --file --list (which runs nothing), and every include and
+# includeIf is followed by hand, whatever its condition. Every word of every value is checked.
+# Prints one path per line; "SYMLINK<TAB>path" when the agent could swap a link on the path;
+# "MISSING<TAB>path" when a risky key names a project path that does not exist yet.
+# $1 = project, stdin = git metadata entries.
 git_config_targets() {
-  local project="$1" g cfg top line origin key val tok p projw pw
+  local project="$1" projw g cfg top
   projw="$(winform "$project")"
   while IFS= read -r g; do
     [ -n "$g" ] || continue
-    git_config_files "$g" | while IFS="$(printf '\t')" read -r cfg top; do
-      git config --file "$cfg" --includes --show-origin --get-regexp "$GIT_PATH_KEYS|$GIT_CMD_KEYS" 2>/dev/null \
-        | while IFS="$(printf '\t')" read -r origin line; do
-          origin="${origin#file:}"; key="${line%% *}"; val="${line#* }"
-          if printf '%s' "$key" | grep -qiE "$GIT_PATH_KEYS"; then
-            set -- "$val"
-          else
-            # A command: check each word that could be a file path.
-            # shellcheck disable=SC2086
-            set -- $(printf '%s' "$val" | tr -d "\"'")
+    git_config_files "$g"
+  done | while IFS="$(printf '\t')" read -r cfg top; do
+    local queue="$cfg" seen="" f
+    while [ -n "$queue" ]; do
+      f="${queue%%$'\n'*}"; [ "$f" = "$queue" ] && queue="" || queue="${queue#*$'\n'}"
+      case "$seen" in *"|$(winform "$f")|"*) continue ;; esac
+      seen="$seen|$(winform "$f")|"
+      local entry key val tok p logical lw pw
+      while IFS= read -r entry; do
+        key="${entry%%=*}"; val="${entry#*=}"; [ "$key" = "$entry" ] && val=""
+        if printf '%s' "$key" | grep -qiE "$GIT_PATH_KEYS"; then
+          set -- "$val"
+        else
+          # shellcheck disable=SC2046,SC2086
+          set -- $(printf '%s' "$val" | tr ';&|()`$<>"'"'"'!=,' '            ')
+        fi
+        for tok in "$@"; do
+          [ -n "$tok" ] || continue
+          case "$tok" in *://*|*@*:*|-*) continue ;; esac
+          case "$tok" in "~"/*) p="$HOME/${tok#\~/}" ;; *) p="$tok" ;; esac
+          if ! is_abs "$p"; then
+            case "$key" in include*) p="$(dirname "$f")/$p" ;; *) p="$top/$p" ;; esac
           fi
-          for tok in "$@"; do
-            case "$tok" in "~"/*) p="$HOME/${tok#\~/}" ;; *) p="$tok" ;; esac
-            if ! is_abs "$p"; then
-              case "$key" in include*) p="$(dirname "$origin")/$p" ;; *) p="$top/$p" ;; esac
-            fi
-            [ -e "$p" ] || { case "$key" in core.hookspath|include*) ;; *) continue ;; esac; }
-            if [ -e "$p" ]; then
-              local logical physical
-              if [ -d "$p" ]; then logical="$(cd -L "$p" && pwd -L)"; physical="$(cd -P "$p" && pwd -P)"
-              else logical="$(cd -L "$(dirname "$p")" && pwd -L)/$(basename "$p")"
-                   physical="$(cd -P "$(dirname "$p")" && pwd -P)/$(basename "$p")"
-                   [ -L "$p" ] && physical="LINK"
-              fi
-              case "$(winform "$logical")/" in "$projw/"*)
-                [ "$(winform "$logical")" = "$(winform "$physical")" ] || { printf 'SYMLINK\t%s\n' "$logical"; continue; } ;;
-              esac
-              p="$physical"
-            fi
-            pw="$(winform "$p")"
+          # Follow includes and conditional includes by hand.
+          case "$key" in include*.path) [ -f "$p" ] && queue="$queue${queue:+$'\n'}$p" ;; esac
+          if [ -e "$p" ] || [ -L "$p" ]; then
+            if [ -d "$p" ]; then logical="$(cd -L "$p" && pwd -L)"
+            else logical="$(cd -L "$(dirname "$p")" && pwd -L)/$(basename "$p")"; fi
+            lw="$(winform "$logical")"; pw="$(winform "$(real_path "$p")")"
+            case "$lw/" in "$projw/"*) [ "$lw" = "$pw" ] || { printf 'SYMLINK\t%s\n' "$logical"; continue; } ;; esac
+            [ "$pw" = "$projw" ] && continue   # never the project root itself
             case "$pw/" in "$projw/"*) echo "$project${pw#"$projw"}" ;; esac
-          done
+          else
+            # A risky key naming a path-like word inside the project that does not exist:
+            # the agent could create it, so fail closed.
+            case "$tok" in */*|*\*|.*) ;; *) printf '%s' "$key" | grep -qiE "$GIT_PATH_KEYS" || continue ;; esac
+            printf '%s' "$key" | grep -qiE "$GIT_RISKY_KEYS" || continue
+            lw="$(winform "$p")"
+            case "$lw" in *..*) lw="$(winform "$(cd -L "$(dirname "$p")" 2>/dev/null && pwd -L)/$(basename "$p")")" ;; esac
+            case "$lw/" in "$projw/"*) printf 'MISSING\t%s\n' "$p" ;; esac
+          fi
         done
+      done < <(git config --file "$f" --list 2>/dev/null)
     done
   done
 }
@@ -392,6 +416,7 @@ $hits
   targets="$(printf '%s\n' "$before" | git_config_targets "$project" | sort -u)"
   while IFS= read -r t; do
     [ -n "$t" ] || continue
+    case "$t" in MISSING*) fail "BLOCKED. Git config names '${t#MISSING?}' inside the project, but it does not exist, so the agent could create it. Create it or remove the setting." 5 ;; esac
     case "$t" in SYMLINK*) fail "BLOCKED. Git config uses '${t#SYMLINK?}', which goes through a symlink the agent could replace. Use a real folder or file there." 5 ;; esac
     [ -e "$t" ] || fail "BLOCKED. Git config points at '$t', which does not exist, so the agent could create it. Create it or remove the setting." 5
     case "$t" in *,*) fail "BLOCKED. Cannot mount '$t' read-only (comma in path)." 5 ;; esac
@@ -413,8 +438,20 @@ $hits
   if [ -n "$new_gits" ]; then
     printf '\033[31memu: WARNING. The agent created git metadata that git diff does not show:\n%s\n     Do not run git in those folders until you have read their hooks/ and config, or deleted them.\n     Also consider: git config --global safe.bareRepository explicit\033[0m\n' "$new_gits" >&2
   fi
-  warn "The agent could edit any file in $project. Review its changes (git diff) before you run them outside the container."
+  warn "The agent could edit any file in $project. Review its changes with: emu review"
   return $code
+}
+
+# Shows what the agent changed, with every git feature that can run a program switched off:
+# no hooks, fsmonitor, pager, external diff or textconv, and bare repos only when named.
+cmd_review() {
+  local safe=(-c core.fsmonitor=false -c core.hooksPath=/dev/null -c diff.external= -c core.pager=cat
+              -c safe.bareRepository=explicit -c core.untrackedCache=false)
+  say "Safe review: git hooks, fsmonitor, pager and diff drivers are off for these commands."
+  git --no-pager "${safe[@]}" status --short --untracked-files=all || return $?
+  echo
+  git --no-pager "${safe[@]}" diff --no-textconv --no-ext-diff --stat "$@"
+  git --no-pager "${safe[@]}" diff --no-textconv --no-ext-diff "$@"
 }
 
 cmd_escape_test() {
@@ -456,6 +493,7 @@ case "$sub" in
   run) cmd_run "$@" ;;
   agent) cmd_agent "$@" ;;
   escape-test) cmd_escape_test ;;
+  review) cmd_review "$@" ;;
   status) cmd_status ;;
   version) echo "emu-guard $EMU_GUARD_VERSION" ;;
   ""|help|-h|--help) show_help ;;
